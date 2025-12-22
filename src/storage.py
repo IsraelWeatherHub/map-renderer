@@ -31,3 +31,12 @@ class Storage:
         except Exception as e:
             print(f"Error uploading file: {e}")
             return False
+
+    def delete_file(self, object_name):
+        try:
+            self.client.remove_object(config.MINIO_BUCKET, object_name)
+            print(f"Deleted {object_name} from {config.MINIO_BUCKET}")
+            return True
+        except Exception as e:
+            print(f"Error deleting file: {e}")
+            return False

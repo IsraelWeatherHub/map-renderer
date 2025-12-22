@@ -1,6 +1,7 @@
-import redis
+import pika
 import json
 import os
+import time
 import config
 from renderer import Renderer
 from storage import Storage
@@ -8,20 +9,40 @@ from storage import Storage
 def main():
     print("Starting MapRenderer Service...")
     
-    # Connect to Redis
-    r = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True)
-    pubsub = r.pubsub()
-    pubsub.subscribe('grib.downloaded')
+    # Connect to RabbitMQ with retry
+    connection = None
+    while True:
+        try:
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host=config.RABBITMQ_HOST, port=config.RABBITMQ_PORT)
+            )
+            print("Connected to RabbitMQ")
+            break
+        except pika.exceptions.AMQPConnectionError:
+            print("RabbitMQ not ready, retrying in 5 seconds...")
+            time.sleep(5)
+
+    channel = connection.channel()
+    
+    # Declare exchange
+    channel.exchange_declare(exchange='weather_events', exchange_type='topic', durable=True)
+    
+    # Declare queue and bind
+    result = channel.queue_declare(queue='', exclusive=True)
+    queue_name = result.method.queue
+    channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key='grib.downloaded')
+    channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key='map.deleted')
     
     renderer = Renderer()
     storage = Storage()
     
-    print("Listening for 'grib.downloaded' events...")
+    print("Listening for events...")
     
-    for message in pubsub.listen():
-        if message['type'] == 'message':
-            try:
-                data = json.loads(message['data'])
+    def callback(ch, method, properties, body):
+        try:
+            data = json.loads(body)
+            
+            if method.routing_key == 'grib.downloaded':
                 print(f"Received task: {data}")
                 
                 grib_path = data['file_path']
@@ -52,18 +73,33 @@ def main():
                     object_name = f"{model}/{run_date}/{run_hour}/{param}/{forecast_hour}.png"
                     storage.upload_file(output_path, object_name)
                     
-                    # Notify completion (optional, for API to clear cache etc)
-                    r.publish('maps.generated', json.dumps({
+                    # Notify completion
+                    message = {
                         "model": model,
                         "run_date": run_date,
                         "run_hour": run_hour,
                         "parameter": param,
                         "forecast_hour": forecast_hour,
                         "url": object_name
-                    }))
-                    
-            except Exception as e:
-                print(f"Error processing message: {e}")
+                    }
+                    ch.basic_publish(
+                        exchange='weather_events',
+                        routing_key='map.generated',
+                        body=json.dumps(message)
+                    )
+                    print(f"Published map.generated: {message}")
+
+            elif method.routing_key == 'map.deleted':
+                print(f"Received delete request: {data}")
+                object_name = data.get('url')
+                if object_name:
+                    storage.delete_file(object_name)
+                
+        except Exception as e:
+            print(f"Error processing message: {e}")
+
+    channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
+    channel.start_consuming()
 
 if __name__ == "__main__":
     main()
