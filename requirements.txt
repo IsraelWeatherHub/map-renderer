@@ -1,0 +1,7 @@
+redis
+minio
+xarray
+cfgrib
+matplotlib
+scipy
+python-dotenv
