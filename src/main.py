@@ -28,8 +28,10 @@ def main():
     channel.exchange_declare(exchange='weather_events', exchange_type='topic', durable=True)
     
     # Declare queue and bind
-    result = channel.queue_declare(queue='', exclusive=True)
-    queue_name = result.method.queue
+    # Use a named queue 'map_renderer_queue' and make it durable so it survives restarts
+    queue_name = 'map_renderer_queue'
+    channel.queue_declare(queue=queue_name, durable=True)
+    
     channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key='grib.downloaded')
     channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key='map.deleted')
     
@@ -94,11 +96,16 @@ def main():
                 object_name = data.get('url')
                 if object_name:
                     storage.delete_file(object_name)
+            
+            # Acknowledge the message
+            ch.basic_ack(delivery_tag=method.delivery_tag)
                 
         except Exception as e:
             print(f"Error processing message: {e}")
+            # Optionally nack or reject, but for now we just log and maybe ack to avoid stuck messages
+            # ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
-    channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
+    channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=False)
     channel.start_consuming()
 
 if __name__ == "__main__":
