@@ -63,33 +63,35 @@ def main():
                 parameters = ["t2m", "apcp"]
                 
                 for param in parameters:
-                    # Generate local output path
-                    output_filename = f"{param}_{forecast_hour}.png"
-                    output_path = os.path.join("/tmp", output_filename)
-                    
-                    # Render
-                    renderer.generate_map(grib_path, output_path, parameter=param)
-                    
-                    # Upload to MinIO
-                    # Key structure: {model}/{run_date}/{run_hour}/{parameter}/{forecast_hour}.png
-                    object_name = f"{model}/{run_date}/{run_hour}/{param}/{forecast_hour}.png"
-                    storage.upload_file(output_path, object_name)
-                    
-                    # Notify completion
-                    message = {
-                        "model": model,
-                        "run_date": run_date,
-                        "run_hour": run_hour,
-                        "parameter": param,
-                        "forecast_hour": forecast_hour,
-                        "url": object_name
-                    }
-                    ch.basic_publish(
-                        exchange='weather_events',
-                        routing_key='map.generated',
-                        body=json.dumps(message)
-                    )
-                    print(f"Published map.generated: {message}")
+                    for region_name, bounds in config.REGIONS.items():
+                        # Generate local output path
+                        output_filename = f"{param}_{forecast_hour}_{region_name}.png"
+                        output_path = os.path.join("/tmp", output_filename)
+                        
+                        # Render
+                        renderer.generate_map(grib_path, output_path, parameter=param, region_bounds=bounds)
+                        
+                        # Upload to MinIO
+                        # Key structure: {model}/{run_date}/{run_hour}/{parameter}/{forecast_hour}_{region}.png
+                        object_name = f"{model}/{run_date}/{run_hour}/{param}/{forecast_hour}_{region_name}.png"
+                        storage.upload_file(output_path, object_name)
+                        
+                        # Notify completion
+                        message = {
+                            "model": model,
+                            "run_date": run_date,
+                            "run_hour": run_hour,
+                            "parameter": param,
+                            "forecast_hour": forecast_hour,
+                            "region": region_name,
+                            "url": object_name
+                        }
+                        ch.basic_publish(
+                            exchange='weather_events',
+                            routing_key='map.generated',
+                            body=json.dumps(message)
+                        )
+                        print(f"Published map.generated: {message}")
 
             elif method.routing_key == 'map.deleted':
                 print(f"Received delete request: {data}")
