@@ -13,8 +13,14 @@ def main():
     connection = None
     while True:
         try:
+            # Set a long heartbeat (600s = 10m) to avoid connection drop during long map generation
             connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=config.RABBITMQ_HOST, port=config.RABBITMQ_PORT)
+                pika.ConnectionParameters(
+                    host=config.RABBITMQ_HOST, 
+                    port=config.RABBITMQ_PORT,
+                    heartbeat=600,
+                    blocked_connection_timeout=300
+                )
             )
             print("Connected to RabbitMQ")
             break
@@ -60,7 +66,7 @@ def main():
                     forecast_hour = "000"
 
                 # Define parameters to generate
-                parameters = ["t2m", "apcp"]
+                parameters = ["t2m", "apcp", "synoptic"]
                 
                 for param in parameters:
                     for region_name, bounds in config.REGIONS.items():
@@ -92,6 +98,9 @@ def main():
                             body=json.dumps(message)
                         )
                         print(f"Published map.generated: {message}")
+                        
+                        # Keep connection alive
+                        connection.process_data_events()
 
             elif method.routing_key == 'map.deleted':
                 print(f"Received delete request: {data}")
@@ -101,7 +110,11 @@ def main():
             
             # Acknowledge the message
             ch.basic_ack(delivery_tag=method.delivery_tag)
-                
+        
+        except pika.exceptions.AMQPError as e:
+            print(f"Critical RabbitMQ error: {e}")
+            # Re-raise to crash the script and trigger restart/reconnect
+            raise e
         except Exception as e:
             print(f"Error processing message: {e}")
             # Optionally nack or reject, but for now we just log and maybe ack to avoid stuck messages
