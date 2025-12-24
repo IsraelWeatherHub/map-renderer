@@ -3,11 +3,121 @@ import json
 import os
 import time
 import config
+import concurrent.futures
 from renderer import Renderer
 from storage import Storage
 
+# Global pool for map rendering (CPU bound)
+map_renderer_pool = None
+
+def process_task(grib_path, output_path, param, bounds, model, run_date, run_hour, forecast_hour, region_name):
+    try:
+        renderer = Renderer()
+        storage = Storage()
+        
+        # Render
+        renderer.generate_map(grib_path, output_path, parameter=param, region_bounds=bounds)
+        
+        # Upload to MinIO
+        # Key structure: {model}/{run_date}/{run_hour}/{parameter}/{forecast_hour}_{region}.png
+        object_name = f"{model}/{run_date}/{run_hour}/{param}/{forecast_hour}_{region_name}.png"
+        storage.upload_file(output_path, object_name)
+        
+        return {
+            "model": model,
+            "run_date": run_date,
+            "run_hour": run_hour,
+            "parameter": param,
+            "forecast_hour": forecast_hour,
+            "region": region_name,
+            "url": object_name
+        }
+    except Exception as e:
+        print(f"Error processing task for {param} {region_name}: {e}")
+        raise e
+
+def handle_grib_task(body):
+    global map_renderer_pool
+    try:
+        data = json.loads(body)
+        print(f"Processing GRIB task in background: {data}")
+        
+        grib_path = data['file_path']
+        model = data['model']
+        run_date = data['run_date']
+        run_hour = data['run_hour']
+        
+        try:
+            forecast_hour = grib_path.split('.f')[-1]
+        except:
+            forecast_hour = "000"
+
+        # Warm up GRIB index sequentially to avoid race conditions in parallel processing
+        print(f"Warming up GRIB index for {grib_path}...")
+        warmup_renderer = Renderer()
+        warmup_renderer.warm_up(grib_path)
+        
+        # Define parameters to generate
+        parameters = ["t2m", "apcp", "synoptic"]
+        
+        futures = []
+        for param in parameters:
+            for region_name, bounds in config.REGIONS.items():
+                # Generate local output path
+                output_filename = f"{param}_{forecast_hour}_{region_name}.png"
+                output_path = os.path.join("/tmp", output_filename)
+                
+                # Submit task to global process pool
+                futures.append(map_renderer_pool.submit(
+                    process_task,
+                    grib_path, output_path, param, bounds,
+                    model, run_date, run_hour, forecast_hour, region_name
+                ))
+        
+        # Establish a connection for publishing results
+        try:
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(
+                    host=config.RABBITMQ_HOST, 
+                    port=config.RABBITMQ_PORT,
+                    heartbeat=600
+                )
+            )
+            channel = connection.channel()
+            channel.exchange_declare(exchange='weather_events', exchange_type='topic', durable=True)
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    message = future.result()
+                    
+                    # Notify completion
+                    channel.basic_publish(
+                        exchange='weather_events',
+                        routing_key='map.generated',
+                        body=json.dumps(message)
+                    )
+                    print(f"Published map.generated: {message}")
+                except Exception as e:
+                    print(f"Task failed: {e}")
+            
+            connection.close()
+        except Exception as e:
+            print(f"Error publishing results: {e}")
+
+    except Exception as e:
+        print(f"Error in handle_grib_task: {e}")
+
 def main():
     print("Starting MapRenderer Service...")
+    
+    # Initialize global process pool
+    global map_renderer_pool
+    # Use a reasonable number of workers (e.g., CPU count)
+    map_renderer_pool = concurrent.futures.ProcessPoolExecutor()
+    
+    # Thread pool for handling incoming GRIB messages concurrently
+    grib_orchestrator_pool = concurrent.futures.ThreadPoolExecutor(max_workers=5)
     
     # Connect to RabbitMQ with retry
     connection = None
@@ -41,86 +151,30 @@ def main():
     channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key='grib.downloaded')
     channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key='map.deleted')
     
-    renderer = Renderer()
     storage = Storage()
     
     print("Listening for events...")
     
     def callback(ch, method, properties, body):
         try:
-            data = json.loads(body)
-            
             if method.routing_key == 'grib.downloaded':
-                print(f"Received task: {data}")
+                # Submit to thread pool for concurrent processing
+                grib_orchestrator_pool.submit(handle_grib_task, body)
                 
-                grib_path = data['file_path']
-                model = data['model']
-                run_date = data['run_date']
-                run_hour = data['run_hour']
-                
-                # Extract forecast hour from filename (e.g., gfs.t12z.pgrb2.0p25.f003)
-                # Simplified extraction
-                try:
-                    forecast_hour = grib_path.split('.f')[-1]
-                except:
-                    forecast_hour = "000"
-
-                # Define parameters to generate
-                parameters = ["t2m", "apcp", "synoptic"]
-                
-                for param in parameters:
-                    for region_name, bounds in config.REGIONS.items():
-                        # Generate local output path
-                        output_filename = f"{param}_{forecast_hour}_{region_name}.png"
-                        output_path = os.path.join("/tmp", output_filename)
-                        
-                        # Render
-                        renderer.generate_map(grib_path, output_path, parameter=param, region_bounds=bounds)
-                        
-                        # Upload to MinIO
-                        # Key structure: {model}/{run_date}/{run_hour}/{parameter}/{forecast_hour}_{region}.png
-                        object_name = f"{model}/{run_date}/{run_hour}/{param}/{forecast_hour}_{region_name}.png"
-                        storage.upload_file(output_path, object_name)
-                        
-                        # Notify completion
-                        message = {
-                            "model": model,
-                            "run_date": run_date,
-                            "run_hour": run_hour,
-                            "parameter": param,
-                            "forecast_hour": forecast_hour,
-                            "region": region_name,
-                            "url": object_name
-                        }
-                        ch.basic_publish(
-                            exchange='weather_events',
-                            routing_key='map.generated',
-                            body=json.dumps(message)
-                        )
-                        print(f"Published map.generated: {message}")
-                        
-                        # Keep connection alive
-                        connection.process_data_events()
-
             elif method.routing_key == 'map.deleted':
+                data = json.loads(body)
                 print(f"Received delete request: {data}")
                 object_name = data.get('url')
                 if object_name:
                     storage.delete_file(object_name)
             
-            # Acknowledge the message
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+            # Auto ack is enabled, so no manual ack needed
         
-        except pika.exceptions.AMQPError as e:
-            print(f"Critical RabbitMQ error: {e}")
-            # Re-raise to crash the script and trigger restart/reconnect
-            raise e
         except Exception as e:
             print(f"Error processing message: {e}")
-            # Optionally nack or reject, but for now we just log and maybe ack to avoid stuck messages
-            # ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
-    channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=False)
+    # Enable auto_ack to allow fire-and-forget processing
+    channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
     channel.start_consuming()
 
 if __name__ == "__main__":

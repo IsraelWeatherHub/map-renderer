@@ -10,6 +10,27 @@ class Renderer:
     def __init__(self):
         pass
 
+    def warm_up(self, grib_path):
+        """
+        Opens the GRIB file with various filters to ensure index files are created
+        sequentially before parallel processing.
+        """
+        print(f"Warming up GRIB index for {grib_path}...")
+        try:
+            # t2m
+            xr.open_dataset(grib_path, engine='cfgrib', backend_kwargs={'filter_by_keys': {'shortName': '2t'}}).close()
+            # apcp
+            xr.open_dataset(grib_path, engine='cfgrib', backend_kwargs={'filter_by_keys': {'shortName': 'tp'}}).close()
+            # synoptic - gh
+            xr.open_dataset(grib_path, engine='cfgrib', backend_kwargs={'filter_by_keys': {'typeOfLevel': 'isobaricInhPa', 'level': 500, 'shortName': 'gh'}}).close()
+            # synoptic - t
+            xr.open_dataset(grib_path, engine='cfgrib', backend_kwargs={'filter_by_keys': {'typeOfLevel': 'isobaricInhPa', 'level': 500, 'shortName': 't'}}).close()
+            # synoptic - prmsl
+            xr.open_dataset(grib_path, engine='cfgrib', backend_kwargs={'filter_by_keys': {'typeOfLevel': 'meanSea', 'shortName': 'prmsl'}}).close()
+            print("GRIB index warm-up complete.")
+        except Exception as e:
+            print(f"Warning: Failed to warm up GRIB index: {e}")
+
     def generate_map(self, grib_path, output_path, parameter="t2m", region_bounds=None):
         """
         Generates a map from a GRIB file.
