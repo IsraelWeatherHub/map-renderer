@@ -31,7 +31,7 @@ class Renderer:
         except Exception as e:
             print(f"Warning: Failed to warm up GRIB index: {e}")
 
-    def generate_map(self, grib_path, output_path, parameter="t2m", region_bounds=None):
+    def generate_map(self, grib_path, output_path, parameter="t2m", region_bounds=None, model="gfs"):
         """
         Generates a map from a GRIB file.
         
@@ -40,8 +40,9 @@ class Renderer:
             output_path: Path where the generated PNG should be saved.
             parameter: The parameter to plot (e.g., 't2m' for 2m temperature).
             region_bounds: Dictionary with lon_min, lon_max, lat_min, lat_max.
+            model: The model name ('gfs' or 'ecmwf').
         """
-        print(f"Generating map for {parameter} from {grib_path}...")
+        print(f"Generating map for {parameter} from {grib_path} (model: {model})...")
         
         try:
             # Determine projection
@@ -88,6 +89,12 @@ class Renderer:
                 # Add cyclic point to avoid white line at Greenwich
                 tp = ds['tp']
                 data = tp.values
+                
+                # Convert units if necessary
+                if model == 'ecmwf':
+                    # ECMWF tp is in meters, convert to mm (kg/m^2)
+                    data = data * 1000.0
+                
                 lons = tp.longitude.values
                 lats = tp.latitude.values
                 data_c, lons_c = add_cyclic_point(data, coord=lons)
@@ -111,8 +118,12 @@ class Renderer:
                 tmp = ds_tmp['t'] - 273.15 # Convert to Celsius
                 
                 # MSLP
-                ds_prmsl = xr.open_dataset(grib_path, engine='cfgrib', backend_kwargs={'filter_by_keys': {'typeOfLevel': 'meanSea', 'shortName': 'prmsl'}})
-                prmsl = ds_prmsl['prmsl'] / 100.0 # Convert to hPa
+                if model == 'ecmwf':
+                    ds_prmsl = xr.open_dataset(grib_path, engine='cfgrib', backend_kwargs={'filter_by_keys': {'typeOfLevel': 'meanSea', 'shortName': 'msl'}})
+                    prmsl = ds_prmsl['msl'] / 100.0 # Convert to hPa
+                else:
+                    ds_prmsl = xr.open_dataset(grib_path, engine='cfgrib', backend_kwargs={'filter_by_keys': {'typeOfLevel': 'meanSea', 'shortName': 'prmsl'}})
+                    prmsl = ds_prmsl['prmsl'] / 100.0 # Convert to hPa
                 
                 # Prepare data for plotting (cyclic point)
                 lons = hgt.longitude.values

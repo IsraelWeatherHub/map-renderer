@@ -16,7 +16,7 @@ def process_task(grib_path, output_path, param, bounds, model, run_date, run_hou
         storage = Storage()
         
         # Render
-        renderer.generate_map(grib_path, output_path, parameter=param, region_bounds=bounds)
+        renderer.generate_map(grib_path, output_path, parameter=param, region_bounds=bounds, model=model)
         
         # Upload to MinIO
         # Key structure: {model}/{run_date}/{run_hour}/{parameter}/{forecast_hour}_{region}.png
@@ -48,7 +48,14 @@ def handle_grib_task(body):
         run_hour = data['run_hour']
         
         try:
-            forecast_hour = grib_path.split('.f')[-1]
+            if model == 'gfs':
+                forecast_hour = grib_path.split('.f')[-1]
+            elif model == 'ecmwf':
+                # ecmwf_ifs_0p25_20251225_00z_3h.grib2
+                forecast_hour = grib_path.split('_')[-1].split('.')[0].replace('h', '')
+                forecast_hour = f"{int(forecast_hour):03d}"
+            else:
+                forecast_hour = "000"
         except:
             forecast_hour = "000"
 
@@ -143,21 +150,27 @@ def main():
     # Declare exchange
     channel.exchange_declare(exchange='weather_events', exchange_type='topic', durable=True)
     
-    # Declare queue and bind
-    # Use a named queue 'map_renderer_queue' and make it durable so it survives restarts
-    queue_name = 'map_renderer_queue'
+    # Determine which model to listen to
+    listen_model = os.getenv("LISTEN_MODEL", "all")
+    
+    # Use a unique queue name based on the model to avoid conflicts
+    queue_name = f'map_renderer_queue_{listen_model}'
     channel.queue_declare(queue=queue_name, durable=True)
     
-    channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key='grib.downloaded')
+    if listen_model == "all":
+        channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key='grib.downloaded.#')
+    else:
+        channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key=f'grib.downloaded.{listen_model}')
+        
     channel.queue_bind(exchange='weather_events', queue=queue_name, routing_key='map.deleted')
     
     storage = Storage()
     
-    print("Listening for events...")
+    print(f"Listening for events on queue {queue_name} (model: {listen_model})...")
     
     def callback(ch, method, properties, body):
         try:
-            if method.routing_key == 'grib.downloaded':
+            if method.routing_key.startswith('grib.downloaded'):
                 # Submit to thread pool for concurrent processing
                 grib_orchestrator_pool.submit(handle_grib_task, body)
                 
